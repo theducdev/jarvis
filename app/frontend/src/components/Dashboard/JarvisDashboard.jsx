@@ -25,86 +25,31 @@ const JarvisDashboard = () => {
     const [wakeFlash, setWakeFlash] = useState(false)
 
     const messagesEndRef = useRef(null)
-    const recognitionRef = useRef(null)
     const currentAudioRef = useRef(null)
+    const mediaRecorderRef = useRef(null)
+    const recordedChunksRef = useRef([])
+    const mediaStreamRef = useRef(null)
+    const lastWakeAtRef = useRef(0)
+    const pendingAutoListenRef = useRef(false)
+    const voiceStateRef = useRef('idle')
+    const prevVoiceStateRef = useRef('idle')
+    useEffect(() => { voiceStateRef.current = voiceState }, [voiceState])
 
-    // Initialize Speech Recognition
+    // Auto-start listening after wake greeting finishes
     useEffect(() => {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-        if (SpeechRecognition) {
-            const recognition = new SpeechRecognition()
-            recognition.continuous = false
-            recognition.interimResults = true
-            recognition.lang = 'en-US'
-
-            recognition.onstart = () => {
-                console.log('Voice recognition started')
-                setVoiceState('listening')
-                setTranscript('')
-            }
-
-            recognition.onresult = (event) => {
-                let finalTranscript = ''
-                let interimTranscript = ''
-
-                for (let i = event.resultIndex; i < event.results.length; i++) {
-                    const result = event.results[i]
-                    if (result.isFinal) {
-                        finalTranscript += result[0].transcript
-                    } else {
-                        interimTranscript += result[0].transcript
-                    }
-                }
-
-                if (finalTranscript) {
-                    const cleanTranscript = finalTranscript.trim()
-
-                    // Check for wake word "Jarvis"
-                    if (cleanTranscript.toLowerCase().startsWith('jarvis')) {
-                        // Strip wake word and process command
-                        const command = cleanTranscript.substring(6).trim()
-                        if (command) {
-                            setTranscript(finalTranscript) // Show full transcript briefly
-                            setInput(command)
-                            setTimeout(() => {
-                                handleVoiceSubmit(command)
-                            }, 300)
-                        }
-                    } else {
-                        console.log('Ignored: No wake word', cleanTranscript)
-                        setTranscript(cleanTranscript) // Show what was heard but don't process
-                    }
-                } else if (interimTranscript) {
-                    setTranscript(interimTranscript)
-                }
-            }
-
-            recognition.onerror = (event) => {
-                console.error('Speech recognition error:', event.error)
-                setVoiceState('idle')
-                if (event.error === 'not-allowed') {
-                    alert('Microphone access denied. Please allow microphone access to use voice commands.')
-                }
-            }
-
-            recognition.onend = () => {
-                console.log('Voice recognition ended')
-                if (voiceState === 'listening') {
-                    setVoiceState('idle')
-                }
-            }
-
-            recognitionRef.current = recognition
-        } else {
-            console.log('Speech Recognition not supported')
+        const prev = prevVoiceStateRef.current
+        prevVoiceStateRef.current = voiceState
+        if (prev === 'speaking' && voiceState === 'idle' && pendingAutoListenRef.current) {
+            pendingAutoListenRef.current = false
+            // Small delay so audio element fully releases the output device
+            setTimeout(() => { if (voiceStateRef.current === 'idle') startRecording() }, 250)
         }
-
-        return () => {
-            if (recognitionRef.current) {
-                recognitionRef.current.abort()
-            }
-        }
-    }, [])
+    }, [voiceState])
+    // VAD (Voice Activity Detection) refs
+    const audioCtxRef = useRef(null)
+    const analyserRef = useRef(null)
+    const vadRafRef = useRef(null)
+    const maxRecordTimeoutRef = useRef(null)
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -117,11 +62,23 @@ const JarvisDashboard = () => {
             try {
                 const msg = JSON.parse(evt.data)
                 if (msg.type === 'wake') {
-                    console.log('[WAKE] Double-clap detected')
+                    const now = Date.now()
+                    const WAKE_COOLDOWN_MS = 30000
+                    // Skip spam: recent wake OR already interacting
+                    if (now - lastWakeAtRef.current < WAKE_COOLDOWN_MS) {
+                        console.log('[WAKE] ignored (cooldown)')
+                        return
+                    }
+                    if (voiceStateRef.current !== 'idle') {
+                        console.log('[WAKE] ignored (busy:', voiceStateRef.current, ')')
+                        return
+                    }
+                    lastWakeAtRef.current = now
+                    console.log('[WAKE] Double-clap detected - arming auto-listen')
+                    pendingAutoListenRef.current = true
                     setWakeFlash(true)
                     setTimeout(() => setWakeFlash(false), 1200)
-                    // Auto-greeting on wake
-                    speak('Good evening, Sir. All systems online.')
+                    speak('Yes, Sir?')
                 }
             } catch (e) {
                 // non-JSON or unrelated — ignore
@@ -241,24 +198,211 @@ const JarvisDashboard = () => {
         setVoiceState('idle')
     }, [])
 
-    // Start/Stop Voice Recognition
-    const toggleVoiceRecognition = () => {
-        if (!recognitionRef.current) {
-            alert('Voice recognition is not supported in your browser. Please use Chrome.')
-            return
-        }
+    // --- Whisper STT via MediaRecorder -----------------------------------
+    const pickMimeType = () => {
+        if (typeof MediaRecorder === 'undefined') return ''
+        const candidates = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+        ]
+        return candidates.find(m => MediaRecorder.isTypeSupported?.(m)) || ''
+    }
 
-        if (voiceState === 'listening') {
-            recognitionRef.current.stop()
-            setVoiceState('idle')
-        } else {
-            try {
-                recognitionRef.current.start()
-            } catch (e) {
-                console.error('Failed to start recognition:', e)
-            }
+    const stopMediaStream = () => {
+        if (mediaStreamRef.current) {
+            mediaStreamRef.current.getTracks().forEach(t => t.stop())
+            mediaStreamRef.current = null
         }
     }
+
+    const stopVAD = () => {
+        if (vadRafRef.current) {
+            cancelAnimationFrame(vadRafRef.current)
+            vadRafRef.current = null
+        }
+        if (maxRecordTimeoutRef.current) {
+            clearTimeout(maxRecordTimeoutRef.current)
+            maxRecordTimeoutRef.current = null
+        }
+        try { audioCtxRef.current?.close() } catch {}
+        audioCtxRef.current = null
+        analyserRef.current = null
+    }
+
+    // Auto-stop when user stops speaking (silence detection)
+    const startVAD = (stream, onSilence) => {
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext
+            const ctx = new AudioCtx()
+            const src = ctx.createMediaStreamSource(stream)
+            const analyser = ctx.createAnalyser()
+            analyser.fftSize = 1024
+            src.connect(analyser)
+            audioCtxRef.current = ctx
+            analyserRef.current = analyser
+
+            const buf = new Uint8Array(analyser.fftSize)
+            const SILENCE_RMS = 0.012        // below this = silence (0..1)
+            const SILENCE_HOLD_MS = 1500     // must stay silent this long
+            const MIN_SPEECH_MS = 400        // need at least this much speech before silence counts
+            const started = performance.now()
+            let silentSince = null
+            let everSpoke = false
+
+            const tick = () => {
+                if (!analyserRef.current) return
+                analyser.getByteTimeDomainData(buf)
+                // Compute RMS on 0..1 scale
+                let sumSq = 0
+                for (let i = 0; i < buf.length; i++) {
+                    const v = (buf[i] - 128) / 128
+                    sumSq += v * v
+                }
+                const rms = Math.sqrt(sumSq / buf.length)
+                const elapsed = performance.now() - started
+
+                if (rms >= SILENCE_RMS) {
+                    everSpoke = true
+                    silentSince = null
+                } else if (everSpoke && elapsed > MIN_SPEECH_MS) {
+                    if (silentSince === null) silentSince = performance.now()
+                    else if (performance.now() - silentSince >= SILENCE_HOLD_MS) {
+                        onSilence()
+                        return
+                    }
+                }
+                vadRafRef.current = requestAnimationFrame(tick)
+            }
+            vadRafRef.current = requestAnimationFrame(tick)
+        } catch (e) {
+            console.warn('VAD init failed (will require manual stop):', e)
+        }
+    }
+
+    const transcribeAndSubmit = async (blob, mime) => {
+        setVoiceState('processing')
+        setTranscript('Transcribing…')
+        try {
+            const buf = await blob.arrayBuffer()
+            const bytes = new Uint8Array(buf)
+            let binary = ''
+            const chunk = 0x8000
+            for (let i = 0; i < bytes.length; i += chunk) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+            }
+            const b64 = btoa(binary)
+
+            const res = await fetch(`${config.API_URL}/speech/speech-to-text`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ audio_data: b64, language: 'en-US', mime })
+            })
+            if (!res.ok) throw new Error(`STT HTTP ${res.status}`)
+            const data = await res.json()
+            const text = (data.text || '').trim()
+            if (!text) {
+                setTranscript('No speech detected.')
+                setTimeout(() => setTranscript(''), 1500)
+                setVoiceState('idle')
+                return
+            }
+            setTranscript(text)
+            handleVoiceSubmit(text)
+        } catch (err) {
+            console.error('Whisper STT failed:', err)
+            setTranscript(`STT error: ${err.message}`)
+            setTimeout(() => setTranscript(''), 2000)
+            setVoiceState('idle')
+        }
+    }
+
+    const startRecording = async () => {
+        if (typeof MediaRecorder === 'undefined') {
+            alert('MediaRecorder is not supported in this browser. Please use Chrome or Edge.')
+            return
+        }
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+            mediaStreamRef.current = stream
+
+            const mime = pickMimeType()
+            const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
+            const effectiveMime = recorder.mimeType || mime || 'audio/webm'
+
+            recordedChunksRef.current = []
+            recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data)
+            }
+            recorder.onstop = async () => {
+                stopVAD()
+                stopMediaStream()
+                const blob = new Blob(recordedChunksRef.current, { type: effectiveMime })
+                recordedChunksRef.current = []
+                if (blob.size < 1000) {
+                    setTranscript('Too short, try again.')
+                    setTimeout(() => setTranscript(''), 1500)
+                    setVoiceState('idle')
+                    return
+                }
+                await transcribeAndSubmit(blob, effectiveMime.split(';')[0])
+            }
+
+            recorder.start()
+            mediaRecorderRef.current = recorder
+            setVoiceState('listening')
+            setTranscript('Listening... speak now')
+
+            // Auto-stop when user goes silent
+            startVAD(stream, () => {
+                console.log('[VAD] silence detected -> stopping')
+                stopRecording()
+            })
+
+            // Hard cap 15s to prevent runaway recording
+            maxRecordTimeoutRef.current = setTimeout(() => {
+                if (mediaRecorderRef.current?.state === 'recording') {
+                    console.log('[VAD] max duration reached -> stopping')
+                    stopRecording()
+                }
+            }, 15000)
+        } catch (err) {
+            console.error('getUserMedia failed:', err)
+            alert('Microphone access denied. Please allow microphone access.')
+            stopMediaStream()
+            setVoiceState('idle')
+        }
+    }
+
+    const stopRecording = () => {
+        const rec = mediaRecorderRef.current
+        if (rec && rec.state !== 'inactive') {
+            rec.stop()
+            mediaRecorderRef.current = null
+        } else {
+            stopVAD()
+            stopMediaStream()
+            setVoiceState('idle')
+        }
+    }
+
+    const toggleVoiceRecognition = () => {
+        if (voiceState === 'listening') {
+            stopRecording()
+        } else if (voiceState === 'idle') {
+            startRecording()
+        }
+    }
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            try { mediaRecorderRef.current?.stop() } catch {}
+            stopVAD()
+            stopMediaStream()
+        }
+    }, [])
 
     // Handle voice submission
     const handleVoiceSubmit = async (voiceText) => {
@@ -338,9 +482,7 @@ const JarvisDashboard = () => {
                 audioLevel={audioLevel}
                 transcript={transcript}
                 onClose={() => {
-                    if (recognitionRef.current && voiceState === 'listening') {
-                        recognitionRef.current.stop()
-                    }
+                    if (voiceState === 'listening') stopRecording()
                     setVoiceState('idle')
                     setTranscript('')
                 }}

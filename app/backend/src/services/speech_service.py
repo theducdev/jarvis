@@ -43,15 +43,86 @@ class SpeechService:
         else:
             print("[INFO] ElevenLabs not configured, using pyttsx3 fallback")
 
+        # --- OpenAI Whisper config ---
+        self.openai_api_key = getattr(settings, 'openai_api_key', None)
+        self.openai_whisper_model = getattr(settings, 'openai_whisper_model', 'whisper-1')
+        self.whisper_available = bool(
+            self.openai_api_key and self.openai_api_key.startswith('sk-')
+        )
+
+        if self.whisper_available:
+            print("[OK] OpenAI Whisper STT enabled")
+        else:
+            print("[INFO] OpenAI Whisper not configured, using Google STT fallback")
+
     # ------------------------------------------------------------------
     # Speech-to-Text
     # ------------------------------------------------------------------
 
-    async def speech_to_text(self, audio_data: str, language: str = "en-US") -> Tuple[str, float]:
-        """Convert speech to text."""
+    async def speech_to_text(
+        self,
+        audio_data: str,
+        language: str = "en-US",
+        mime: str = "audio/webm",
+    ) -> Tuple[str, float]:
+        """Convert speech to text. Prefers OpenAI Whisper, falls back to Google."""
         try:
             audio_bytes = base64.b64decode(audio_data)
+        except Exception as e:
+            return f"Invalid audio payload: {e}", 0.0
 
+        if self.whisper_available:
+            try:
+                text = await self._whisper_transcribe(audio_bytes, language, mime)
+                return text, 0.95
+            except Exception as e:
+                print(f"[WARN] Whisper STT failed ({e}), falling back to Google STT")
+
+        return await self._google_stt(audio_bytes, language)
+
+    async def _whisper_transcribe(
+        self,
+        audio_bytes: bytes,
+        language: str,
+        mime: str,
+    ) -> str:
+        """Transcribe via OpenAI Whisper API."""
+        ext_map = {
+            "audio/webm": "webm",
+            "audio/ogg": "ogg",
+            "audio/wav": "wav",
+            "audio/wave": "wav",
+            "audio/x-wav": "wav",
+            "audio/mpeg": "mp3",
+            "audio/mp4": "mp4",
+            "audio/m4a": "m4a",
+        }
+        ext = ext_map.get(mime.lower().split(";")[0].strip(), "webm")
+        filename = f"audio.{ext}"
+
+        # Whisper accepts ISO-639-1 codes (e.g. "en", "vi"). Trim locale suffix if any.
+        lang_code = (language or "en").split("-")[0].lower()
+
+        files = {"file": (filename, audio_bytes, mime)}
+        data = {"model": self.openai_whisper_model}
+        if lang_code and lang_code != "auto":
+            data["language"] = lang_code
+
+        headers = {"Authorization": f"Bearer {self.openai_api_key}"}
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers=headers,
+                data=data,
+                files=files,
+            )
+            response.raise_for_status()
+            return response.json().get("text", "").strip()
+
+    async def _google_stt(self, audio_bytes: bytes, language: str) -> Tuple[str, float]:
+        """Fallback Google speech_recognition STT (expects WAV)."""
+        try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 f.write(audio_bytes)
                 temp_path = f.name
@@ -62,11 +133,8 @@ class SpeechService:
                     self.executor,
                     lambda: self.recognizer.recognize_google(audio, language=language)
                 )
-                confidence = 0.9
-
             os.unlink(temp_path)
-            return text, confidence
-
+            return text, 0.9
         except sr.UnknownValueError:
             return "Could not understand audio", 0.0
         except sr.RequestError as e:

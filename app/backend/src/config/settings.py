@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # Speech
     speech_recognition_engine: str = "whisper"
     whisper_model: str = "base"
+    openai_api_key: Optional[str] = None
+    openai_whisper_model: str = "whisper-1"
     eleven_labs_api_key: Optional[str] = None
     eleven_labs_voice_id: str = "pNInz6obpgDQGcFmaJgB"  # "Adam" voice
     eleven_labs_model: str = "eleven_monolingual_v1"
@@ -41,8 +43,8 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     chat_rate_limit_per_minute: int = 20
 
-    # Request size
-    max_request_size_mb: float = 1.0
+    # Request size (Whisper audio blobs can exceed 1 MB easily)
+    max_request_size_mb: float = 25.0
 
     class Config:
         env_file = ".env"

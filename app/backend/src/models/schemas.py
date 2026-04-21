@@ -16,6 +16,7 @@ class MessageResponse(BaseModel):
 class SpeechRequest(BaseModel):
     audio_data: str  # base64 encoded audio
     language: str = "en-US"
+    mime: str = "audio/webm"
 
 class SpeechResponse(BaseModel):
     text: str

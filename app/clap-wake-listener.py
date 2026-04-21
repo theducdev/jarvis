@@ -21,6 +21,17 @@ WAKE_URL = os.getenv("WAKE_URL", "http://localhost:8000/api/v1/system/wake")
 MIC_DEVICE = os.getenv("CLAP_MIC_DEVICE_INDEX")
 MIC_DEVICE = int(MIC_DEVICE) if MIC_DEVICE and MIC_DEVICE.isdigit() else None
 
+def _float_env(name, default):
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except ValueError:
+        return default
+
+ENV_THRESHOLD = _float_env("CLAP_THRESHOLD", None)
+# Raise floor hard — speech at normal volume should NOT cross this.
+THRESHOLD_FLOOR = _float_env("CLAP_THRESHOLD_FLOOR", 0.35)
+
 
 def calibrate(reader, duration_s=3.0):
     """Sample ambient noise to set a sane baseline threshold."""
@@ -32,7 +43,7 @@ def calibrate(reader, duration_s=3.0):
         if time.monotonic() >= deadline:
             break
     noise_floor = max(samples) if samples else 0.02
-    threshold = max(noise_floor * 4.0, 0.08)
+    threshold = max(noise_floor * 5.0, THRESHOLD_FLOOR)
     print(f"[CALIBRATE] Noise floor={noise_floor:.4f}, threshold={threshold:.4f}")
     return threshold
 
@@ -64,7 +75,13 @@ def main():
     reader.start()
 
     try:
-        threshold = args.threshold if args.threshold else calibrate(reader)
+        if args.threshold is not None:
+            threshold = args.threshold
+        elif ENV_THRESHOLD is not None:
+            threshold = ENV_THRESHOLD
+            print(f"[CONFIG] Using CLAP_THRESHOLD={threshold:.4f} from env (skip calibration)")
+        else:
+            threshold = calibrate(reader)
         detector = DoubleClapDetector(threshold=threshold)
 
         print(f"[READY] Listening. Clap twice to wake JARVIS. (device={args.device})")
